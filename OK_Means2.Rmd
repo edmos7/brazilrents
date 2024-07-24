@@ -1,0 +1,772 @@
+---
+title: "Brazil Rent Report - Data Analysis for Business 2023"
+author: "Eduardo Mosca, Chakir El Arrag, Iraj Nayebkhil"
+date: "`r Sys.Date()`"
+output: pdf_document
+editor_options: 
+  markdown: 
+    wrap: sentence
+geometry: margin=1in
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+```
+
+In this report, we look at the dataset for rent prices in Brazil, specifically along the south border, looking for specifics of variables and characteristics which might help paint the picture for our (hypothetical) employer's entry in the market.
+We now take a look at the dataset and its variables.
+
+```{r,echo = FALSE,warning=FALSE,message=FALSE}
+# Importing the libraries needed 
+library(gam)
+library(xgboost)
+library(tidyverse)
+library(glmnet)
+library(caret)
+library(ggplot2)
+library(ggrepel)
+library(ggpubr)
+library(dplyr)
+library(plyr)
+library(maps)
+library(cowplot)
+library(MASS)
+library(rpart)
+library(rpart.plot)
+library(gglasso)
+library(factoextra)
+library(cluster)
+
+
+# Importing the dataset
+Data = read.csv("BrazHousesRent.csv", sep = ",", dec = ".", header = T, colClasses = "character")
+```
+
+# 1 - Overview of the dataset
+Of the 12 variables on hand, five of them continuous (fire insurance, property tax, HOA fee, rent amount and area), three are categorical(animal accepted,apartment furnished, and city where property is located).
+The remaining four are numerical discrete, they represent the floor number and the number of rooms, bathrooms, and parking spots.
+We have a rough dataset of 10692 observations, not a lot but enough to extract valuable info.
+We start cleaning the dataset: there are no specific NA's but the floor has "-" values.
+By calling anyDuplicated we also notice some duplicate rows, we want to remove them with "unique()".
+```{r, echo = FALSE,warning=FALSE,message=FALSE}
+Data <- unique(Data)
+```
+The floor column has a '-' value which is pretty occurent in our dataset.
+```{r}
+# Counting the occurences
+count_zero <- sum(Data$floor == "-")
+print(paste("The number of observations with floor '-' is:", count_zero))
+```
+
+We have 2369 observations with floor "-" on our dataset, interestingly the minimum value in the floor column is 1, which suggests that "-" would represent the ground floor or houses that are not in a condominium.
+To be sure, we extract from the dataset the HOA (Homeowners Association Tax) for houses on the '-' floor.
+
+```{r}
+# Counting observations with floor '-' and hoa 0, we also show their proportion
+floor_abs <- subset(Data, floor == "-", select = hoa..R..)
+floor_abs[,1] = as.numeric(floor_abs[,1])
+count_zero <- sum(floor_abs[, 1] == 0)
+print(paste("Number of observations with floor '-' and HOA = 0", count_zero))
+print(paste("Proportion of observations with floor '-' and HOA = 0", count_zero/length(floor_abs[, 1])))
+```
+
+As we can see, 85,06% of the observations has an HOA of 0, which strengthens our hypothesis since owners of normal houses don't have an HOA tax to pay because the houses are not situated in a condominium.
+The rest of the occurences with HOA higher than 0, can be justified by the presence of some condominiums with houses on the ground floor, not very frequent but this would justify why they're paying the HOA tax while at the same time being at floor '-'.
+Since the data is compatible with our hypothesis, we'll proceed by replacing '-' by 0.
+
+```{r}
+# Replace '-' by 0 in the floor column
+Data[Data == "-"] <- 0
+```
+
+Next, we set the variables to be either numeric or factors.
+
+```{r}
+#Turn categs to factors, numerical to numeric
+categ <- c("city","animal","furniture")
+cols <- colnames(Data)
+for(i in 1:ncol(Data)){
+  if (cols[i] %in% categ){
+    Data[,i] = as.factor(Data[,i])
+  }else{
+    Data[,i] = as.numeric(Data[,i])
+  }
+}
+```
+
+# 2 - Looking at the response variable
+
+We can look at the geographical position of the cities we have info on, and visualize which ones are more expensive on average.
+
+```{r}
+# Function that computes the average rent amount for a given city
+average_rent_price <- function(City) {
+  city_rent_amounts <- subset(Data, city == City, select = rent.amount..R..)
+  average_rent <- mean(city_rent_amounts$rent.amount..R..)
+  return(average_rent)
+}
+```
+
+```{r fig2, fig.height = 4, fig.width = 6, fig.align = "center",,warning=FALSE,message=FALSE,echo=FALSE}
+#Making the map plot
+city_data <- data.frame(
+  City = c("Belo Horizonte", "Campinas", "Porto Alegre", "Rio de Janeiro", "Sao Paulo"),
+  Latitude = c(-19.9167, -22.9071, -30.0346, -22.9068, -23.5505),
+  Longitude = c(-43.9345, -47.0632, -51.2177, -43.1729, -46.6333),
+  Average_Rent = sapply(c("Belo Horizonte", "Campinas", "Porto Alegre", "Rio de Janeiro", "São Paulo"), 
+                        function(x) average_rent_price(x))
+)
+
+city_data$Alpha <- (city_data$Average_Rent -
+                      min(city_data$Average_Rent)) / (max(city_data$Average_Rent) 
+                                                      - min(city_data$Average_Rent))
+
+# Plot the geospatial data
+map_brazil <- map_data("world", region = "Brazil")
+
+ggplot() +
+  geom_polygon(data = map_brazil, aes(x = long, y = lat, group = group), fill = "lightgray", color = "white") +
+  geom_label_repel(data = city_data, aes(x = Longitude, y = Latitude, label = City), color = "black", size = 3,
+                   box.padding = 0.5, point.padding = 0.2, force = 1, segment.color = "transparent") +
+  geom_point(data = city_data, aes(x = Longitude, y = Latitude, color = Average_Rent), alpha = 0.8, size = 5) +
+  labs(title = "Average Rent in Different Cities in Brazil",
+       x = "Longitude",
+       y = "Latitude") +
+  scale_color_gradient(low = "blue", high = "red") +
+  theme_minimal()
+
+```
+
+As we can see Sao Paulo tends to be the most expensive place to rent a house.
+
+A high correlation is observed between fire insurance and rent, suggesting that fire insurance could be a valuable variable for modeling.
+
+```{r}
+cor(Data$fire.insurance..R..,Data$rent.amount..R..)
+```
+
+### Defining our objective
+
+Our objective is to *Build a predictive model and find out the rent amount according to the house specifics*, by using regression methods on the response variable rent.amount..R..
+
+# 3 - Lower Dimensional Models
+
+When thinking about low dimension models, we must understand which ones might apply to our use case, yielding information that is actually valuable.
+We need to better understand relations between the response and some variables.
+Its valuable to know how much the rent increases as the number of rooms or area increases.
+We first implement a Log-Linear regression model to see what percentage increase there is when the area goes up by one unit:
+
+```{r}
+fit1 <- lm(log(rent.amount..R..) ~ area,data = Data)
+summary(fit1)$coefficients
+```
+
+By looking at the coefficients, we see the expcted % increase following an increase in the area by 1 unit.
+We also want to model the reasoning of a person interested in renting an apartment in Brazil via deicision tree, by considering the main concerns when house shopping.
+This will give us insight on the price levels according to specifics:
+
+```{r, fig0, fig.height = 3, fig.width = 4, fig.align = "center",,warning=FALSE,message=FALSE}
+dtree <- rpart(rent.amount..R.. ~ rooms + furniture + bathroom, data = Data, method = "anova")
+rpart.plot(dtree)
+```
+The specifics leading to higher rent are to the right, while following the left-most branch we get cheaper rent.
+
+
+
+# 4 - Getting the data ready
+
+We start by removing outliers in the continuous variables using the IQR.
+For discrete numerical variables, we give a look at the boxplots and we remove outliers manually.
+
+```{r}
+# Continuous variables
+cont <- c("area","fire.insurance..R..","property.tax..R..","hoa..R..", "floor")
+
+#Removing outliers of continuous variables using IQR
+for(i in 1:ncol(Data)){
+  if (cols[i] %in% cont){
+    Q3 <- quantile(Data[,i], .75)
+    IQR <- IQR(Data[,i])
+    Data <- subset(Data, Data[,i]< (Q3 + 3.5*IQR))
+  }
+}
+
+#Removing outliers from discrete variables
+Data <- subset(Data, floor < 40)
+Data <- subset(Data, rooms < 10)
+Data <- subset(Data, bathroom < 7)
+```
+
+Then, we turn the variables animal and furniture to 0s and 1s, the variables in the original dataset take a binary value encoded as a character (ex. for animal we have acept and not acept)
+
+```{r, warning=FALSE, message=FALSE}
+# Turning variables animal and furniture to 0s and 1s
+
+#Animal
+vec <- Data$animal
+vec <- as.character(vec)
+vec[vec == "acept"] <- 1      # Replace "acept" by 1
+vec[vec == "not acept"] <- 0       # Replace "not acept" by 0
+vec <- as.factor(vec)
+Data$animal <- vec
+
+#Furniture
+vec <- Data$furniture
+vec <- as.character(vec)
+vec[vec == "furnished"] <- 1      # Replace "furnished" by 1
+vec[vec == "not furnished"] <- 0       # Replace "not furnished" by 0
+vec <- as.factor(vec)
+Data$furniture <- vec
+```
+
+After that we split the dataset into training validation and test sets, and we scale them using the mean and standard deviation of the training set.
+We save main training set (training + validation) to work with it later for the test set prediction.
+
+```{r,warning=FALSE,message=FALSE}
+#Train test split
+# We first split into training and test set, then we split the training set into a smaller training set and a validation set
+set.seed(1)
+trainrows <- createDataPartition(Data$rent.amount..R.., p=0.8, list=FALSE)
+training_set <- Data[trainrows,] # This is saved and will be scaled later to work on the test set
+d_test <- Data[-trainrows,]
+trainrows <- createDataPartition(training_set$rent.amount..R.., p=0.8, list=FALSE)
+d_train <- training_set[trainrows,]
+d_val <- training_set[-trainrows,]
+
+
+# Scaling the data
+# We make a function that scales the data in dataset using the mean and sd of dataset2
+scale_data <- function(dataset, dataset2) {
+  for(i in 1:ncol(dataset)){
+    if (is.numeric(dataset[1,i])){
+      dataset[,i] = scale(dataset[,i], center = mean(dataset2[,i]), scale = sd(dataset2[,i]))
+    }
+  }
+  return(dataset)
+} 
+
+# Scaling the training, validation and test sets
+d_val <- scale_data(d_val, d_train)
+d_test <- scale_data(d_test, training_set)
+d_train <- scale_data(d_train, d_train) #Training set last since we use its mean and sd to scale the val set
+```
+
+Finally, we encode categorical variables (We keep an unencoded version of the training and validation sets for later).
+
+```{r,warning=FALSE,message=FALSE, echo=FALSE}
+# Saving unencoded versions of training and validation sets
+d_train_unenc <- d_train
+d_val_unenc <- d_val
+
+# We make a function to encode the categorical variables in a dataset
+encode <- function(dataset, excluded=c()) {
+  excluded_cols <- dataset[, names(dataset) %in% excluded]
+  dataset <- dataset[,!names(dataset) %in% excluded]
+  dmy <- dummyVars(" ~ .", data = dataset)
+  dataset <- data.frame(predict(dmy, newdata = dataset))
+  dataset <- cbind(dataset, excluded_cols)
+  return(dataset)
+}  
+
+# Encoding the categorical variables in the training, validation and test sets
+d_train <- encode(d_train, c("animal", "furniture"))
+d_val <- encode(d_val, c("animal", "furniture"))
+d_test <- encode(d_test, c("animal", "furniture"))
+```
+
+# 5 - Testing the models' performances, Model Selection
+
+## 5.1 - AIC and BIC
+
+First we implement AIC and BIC stepwise selection for multiple regression models, then we evaluate the performance on the validation set using the following metrics: **MSE**, **RMSE** and **R Squared**.
+
+```{r,echo=FALSE}
+# Implemention of AIC and BIC stepwise selection for multiple regression models
+full.model <- lm(rent.amount..R.. ~ ., data = d_train)
+step.model.aic <- stepAIC(full.model, direction = "both", trace = 0)
+
+step.model.bic <- stepAIC(full.model, direction = "both", trace = 0, k = log1p(nrow(d_train)))
+
+predictions.aic <- predict(step.model.aic, newdata = d_val)
+predictions.bic <- predict(step.model.bic, newdata = d_val)
+
+
+# Models' performance on the validation set
+aic_mse <- mean((predictions.aic - d_val$rent.amount..R..)^2)
+bic_mse <- mean((predictions.bic - d_val$rent.amount..R..)^2)
+aic_rmse <- sqrt(aic_mse)
+bic_rmse <- sqrt(bic_mse)
+aic_rsquared <- summary(step.model.aic)$r.squared
+bic_rsquared <- summary(step.model.bic)$r.squared
+
+#Data frame to store the evaluation metrics
+table <- data.frame(
+  Model = character(),  
+  MSE = numeric(),
+  RMSE = numeric(),
+  R_squared = numeric()
+)
+table <- rbind(table, c("AIC", round(aic_mse, 5), round(aic_rmse, 5), round(aic_rsquared, 5)))
+table <- rbind(table, c("BIC", round(bic_mse, 5), round(bic_rmse, 5), round(bic_rsquared, 5)))
+colnames(table) <- c("Model", "MSE", "RMSE", "R_squared")
+
+print(table)
+```
+
+Our two models tend to yield similar results, BIC tends to be slightly better, so we're gonna consider it over AIC.
+We can also plot the residuals against the fitted values of each:
+
+```{r fig7, fig.height = 3, fig.width = 7, fig.align = "center",echo=FALSE,warning=FALSE,message=FALSE}
+bicplot <- ggplot(data.frame(Fitted = step.model.bic$fitted.values, Residuals = step.model.bic$residuals), aes(x = Fitted, y = Residuals)) +
+  geom_point(color = "blue") + 
+  theme_minimal() +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+  labs(title = "Res v Fitted BIC", x = "Fitted Values", y = "Residuals")
+aicplot <- ggplot(data.frame(Fitted = step.model.aic$fitted.values, Residuals = step.model.aic$residuals), aes(x = Fitted, y = Residuals)) +
+  geom_point(color = "blue") + 
+  theme_minimal() +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+  labs(title = "Res v Fitted AIC", x = "Fitted Values", y = "Residuals")
+ggarrange(aicplot,bicplot,nrow = 1,ncol = 2)
+```
+
+The two are pretty similar and for the most part the points hover around the 0 line, which indicats a good fit.
+When getting a similar result for AIC and BIC we can assume to be striking a good balance between model complexity and goodness of fit.
+
+## 5.2 - Lasso and Group-Lasso
+
+Let's implement a lasso regression using glmnet and group-Lasso using gglasso.
+We start directly from 10-fold cross validation, and then we evaluate the model on the validation set using the lambda.min and lambda.1se
+
+```{r fig4, fig.height = 6, fig.width = 6, fig.align = "center",out.width=2,echo=FALSE,warning=FALSE,message=FALSE}
+# Performing 10-fold cross validation
+X = model.matrix(rent.amount..R.. ~ ., data=d_train)[,-1]
+y = d_train$rent.amount..R..
+cvlasso = cv.glmnet(x = X, y = y,nfolds = 10)
+groups <- c(1,1,1,1,1,2,3,4,5,6,7,8,9,10,11)
+glasso = cv.gglasso(x=X, y=y, group = groups,nfolds = 10)
+```
+
+```{r,echo=FALSE}
+# Models' performance on the validation set using the lambda.min and lambda.1se
+
+pen_val <- model.matrix(rent.amount..R.. ~ ., data=d_val)[,-1]
+lassopredmin <- predict(cvlasso,pen_val, s = "lambda.min")
+lmin_mse <- mean((lassopredmin - d_val$rent.amount..R..)^2)
+lmin_rmse <- sqrt(lmin_mse)
+lmin_Rsq <- cor(lassopredmin,d_val$rent.amount..R..)^2
+lassopred1se <- predict(cvlasso,pen_val, s = "lambda.1se")
+lse_mse <- mean((lassopred1se - d_val$rent.amount..R..)^2)
+
+glpred1 <- predict(glasso,pen_val, s="lambda.1se")
+gl1_MSE <- mean((glpred1 - d_val$rent.amount..R..)^2)
+gl1_Rsq <- cor(glpred1,d_val$rent.amount..R..)^2
+glpred2 <- predict(glasso,pen_val, s="lambda.min")
+gl2_MSE <- mean((glpred2 - d_val$rent.amount..R..)^2)
+gl2_Rsq <- cor(glpred2,d_val$rent.amount..R..)^2
+
+```
+
+The lambda.min values get a lower error on the validation set, so let's compare the two models using minimum lambda:
+
+```{r,fig5, fig.height = 4, fig.width = 4,fig.align = "center",echo=FALSE,warning=FALSE,message=FALSE,}
+#Data frame to store the evaluation metrics
+table <- data.frame(
+  Model = character(),  
+  MSE = numeric(),
+  RMSE = numeric(),
+  R_squared = numeric()
+)
+table <- rbind(table, c("Lasso", round(lmin_mse, 5), round(sqrt(lmin_mse), 5), round(lmin_Rsq, 5)))
+table <- rbind(table, c("grLasso", round(gl2_MSE, 5), round(sqrt(gl2_MSE), 5), round(gl2_Rsq, 5)))
+colnames(table) <- c("Model", "MSE", "RMSE", "R_squared")
+print(table)
+```
+
+## 5.3 - GAM
+
+We create the smoothing terms for numerical and categorical variables (We're going to use the unencoded versions of the training and validation sets we saved earlier), then we create the GAM formula summing the smoothing terms and we feed it to the model to do the fitting.
+
+```{r}
+# Smoothing terms for numerical variables
+num_names = names(d_train_unenc)[d_train_unenc %>% map_lgl(is.numeric)]
+num_names = num_names %>% 
+  discard(~.x %in% c("rent.amount..R.."))
+num_feat = num_names %>% 
+  map_chr(~paste0("s(", .x, ", 10)")) %>%
+  paste(collapse = "+")
+
+# Smoothing terms for categorical variables
+cat_feat = names(d_train_unenc)[d_train_unenc %>% map_lgl(is.factor)] %>% 
+  paste(collapse = "+")
+
+# GAM formula
+gam_form = as.formula(paste0("rent.amount..R.. ~", num_feat, "+", cat_feat))
+
+# Model fitting
+fit_gam = gam(formula = gam_form, family = "gaussian", data = d_train_unenc)
+```
+
+```{r fig111,fig.height=3,fig.width=6, fig.align='center'}
+ggplot(data.frame(Fitted = fit_gam$fitted.values, Residuals = fit_gam$residuals), aes(x = Fitted, y = Residuals)) +
+  geom_point(color = "red") + 
+  theme_minimal() +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "green") +
+  labs(title = "Residuals vs Fitted Values", x = "Fitted Values", y = "Residuals")
+```
+
+In this case as well, most of the points hover around the 0 line, with most of the residuals being in the interval $\left [ -0.5, 0.5 \right ]$, which indicates a good fit.
+After, we predict on the validation set and we evaluate the prediction using the metrics mentioned previously.
+We'll save them for the models comparison.
+
+```{r}
+# Predicting the validation set
+predicted_values = predict(fit_gam, d_val_unenc) 
+
+# Evaluation metrics
+observed_values = d_val_unenc$rent.amount..R..
+gam_mse = mean((predicted_values - observed_values)^2)
+gam_rmse = sqrt(gam_mse)
+gam_rsquared = cor(predicted_values, observed_values)^2
+```
+
+## 5.4 - XGBoost
+
+Now we create an XGBoost model.
+We start by splitting dependent and independent variables and transforming the training and validation sets to xgb.Dmatrices which will be used for training and prediction.
+
+```{r, warning=FALSE,message=FALSE}
+X_train <- d_train[, !(colnames(d_train) %in% c("rent.amount..R.."))]
+y_train <- as.numeric(d_train$rent.amount..R..)
+
+X_val <- d_val[, !(colnames(d_val) %in% c("rent.amount..R.."))]
+y_val <- as.numeric(d_val$rent.amount..R..)
+
+#Make sure the columns are numeric before making the xgb.DMatrix that XGBoost is gonna use
+for(i in 1:ncol(X_train)){
+  X_train[,i] = as.numeric(X_train[,i])
+}
+
+for(i in 1:ncol(X_val)){
+  X_val[,i] = as.numeric(X_val[,i])
+}
+
+xgb_train <- xgb.DMatrix(data = as.matrix(X_train), label = y_train)
+xgb_val <- xgb.DMatrix(data = as.matrix(X_val))
+```
+
+We use 10-fold cross validation for parameter tuning.
+The parameters we want to tune are the following: nrounds(Number of boosting rounds), max_depth(Maximum tree depth), eta(Learning rate)
+
+```{r, warning=FALSE,message=FALSE}
+# Parameter grid
+param_grid <- expand.grid(
+  nrounds = c(100, 200, 300),
+  max_depth = c(3, 4, 5),             
+  eta = c(0.01, 0.05, 0.1),
+  gamma = 0,
+  colsample_bytree = 1,
+  min_child_weight = 1,  
+  subsample = 1   
+)
+
+# The other parameters that have a fixed value are included in the grid just because excluding them throws an error when we run cv, however we   gave them a fixed value (default value of the model) so that we don't include them in the cross validation process
+```
+
+We put the parameters to tune and their respective values the we would like to test in a parameter grid.
+Then, we use the parameter grid as an input to perform 10-fold cross validation in order to get the best combination of values for the parameters.
+
+```{r, warning=FALSE,message=FALSE}
+# 10-fold cross-validation
+xgb_model <- train(
+  X_train, y_train, 
+  method = "xgbTree",
+  trControl = trainControl(method = "cv", number = 10),
+  tuneGrid = param_grid,
+  metric = 'RMSE',
+  verbosity = 0
+)
+```
+
+Finally, we fit the final XGBoost model with the best parameters we got, we proceed to predict on the validation set and we evaluate the prediction, We save the errors models comparison.
+
+```{r, warning=FALSE,message=FALSE}
+# Model fitting
+final_model <- xgboost(
+  data = xgb_train, 
+  nrounds = xgb_model$bestTune$nrounds,
+  max_depth = xgb_model$bestTune$max_depth,
+  eta = xgb_model$bestTune$eta,
+  verbose = 0
+)
+
+# Evaluation of the model
+predictions <- predict(final_model, newdata = xgb_val)
+xgb_mse <- mean((predictions - y_val)^2)
+xgb_rmse <- sqrt(xgb_mse)
+xgb_rsquared <- 1 - (sum((y_val - predictions)^2) / sum((y_val - mean(y_val))^2))
+```
+
+## 5.5 - Model comparison
+We make a table with the errors for the models we tested until now
+
+```{r}
+#Data frame to store the evaluation metrics
+table <- data.frame(
+  Model = character(),  
+  MSE = numeric(),
+  RMSE = numeric(),
+  R_squared = numeric()
+)
+
+table <- rbind(table, c("BIC", round(bic_mse, 5), round(bic_rmse, 5), round(bic_rsquared, 5)))
+table <- rbind(table, c("LASSO", round(lmin_mse, 5), round(lmin_rmse, 5), round(lmin_Rsq, 5)))
+table <- rbind(table, c("GAM", round(gam_mse, 5), round(gam_rmse, 5), round(gam_rsquared, 5)))
+table <- rbind(table, c("XGBoost", round(xgb_mse, 5), round(xgb_rmse, 5), round(xgb_rsquared, 5)))
+colnames(table) <- c("Model", "MSE", "RMSE", "R_squared")
+
+print(table)
+```
+
+We notice that the model that performs the best is XGBoost, we're going to use it to predict on the test set.
+
+# 6 - Prediction on the test set
+
+We start by scaling the training set (training + validation) and we encode its categoricals, then we transform the training and test sets to xgb.Dmatrices.
+Next, we fit the model and we make predictions on the test set without forgetting to evaluate our predictions.
+
+```{r, warning=FALSE,message=FALSE}
+# Scaling and encoding training set
+training_set <- scale_data(training_set, training_set)
+training_set <- encode(training_set, c("animal", "furniture"))
+
+# Splitting dependent and independent variables
+X_train <- training_set[, !(colnames(training_set) %in% c("rent.amount..R.."))]
+y_train <- as.numeric(training_set$rent.amount..R..)
+
+X_test <- d_test[, !(colnames(d_test) %in% c("rent.amount..R.."))]
+y_test <- as.numeric(d_test$rent.amount..R..)
+
+# Making sure the columns are numeric
+for(i in 1:ncol(X_train)){
+  X_train[,i] = as.numeric(X_train[,i])
+}
+for(i in 1:ncol(X_val)){
+  X_test[,i] = as.numeric(X_test[,i])
+}
+
+# Transforming the training and test sets to xgb.Dmatrices
+xgb_train <- xgb.DMatrix(data = as.matrix(X_train), label = y_train)
+xgb_test <- xgb.DMatrix(data = as.matrix(X_test))
+
+# Model fitting
+final_model <- xgboost(
+  data = xgb_train, 
+  nrounds = xgb_model$bestTune$nrounds,
+  max_depth = xgb_model$bestTune$max_depth,
+  eta = xgb_model$bestTune$eta,
+  verbose = 0
+)
+
+# Predicting on the test set
+predictions <- predict(final_model, newdata = xgb_test)
+
+# Evaluation of the performance
+test_mse <- mean((predictions - y_test)^2)
+test_rmse <- sqrt(xgb_mse)
+test_rsquared <- 1 - (sum((y_test - predictions)^2) / sum((y_test - mean(y_test))^2))
+print(paste("MSE: ", round(test_mse, 5)))
+print(paste("RMSE: ", round(test_rmse, 5)))
+print(paste("R Squared: ", round(xgb_rsquared, 5)))
+```
+
+Test and validation set values are similar, this means that the model is consistent and performs well on unseen data.
+Having low errors, we can allow accurately predict rent prices in important cities in Brazil, we can use this model to assess the returns and company concerns regarding chargeable rent before investment.
+By leveraging cost data we can spot houses that our business can invest in with higher turnover.
+Moreover, an high R-squared value indicates that a large proportion of the variance is explained by the variables used in our model.
+It implies that there is a strong and consistent relationship between the independent variables and the rent prices.
+We can say that the independent variables could be enough and we might not need to add more variables for this purpose.
+Now we should evaluate each variables' importance.
+
+```{r fig22, fig.width=6,fig.height=3,fig.align='center'}
+#Feature importance scores
+importance_scores <- xgb.importance(
+  feature_names = colnames(X_train),
+  model = final_model
+)
+
+#Plot feature importance
+xgb.plot.importance(importance_matrix = importance_scores)
+```
+
+From the plot, fire.insurance..R.. is the most important variable. City variables stand out, with Porto Alegre and São Paulo being the most significant, probably since Porto Alegre has the lowest average rent price, while São Paulo has the highest. Floor and hoa..R.. are also important variables. Surprisingly, the house area and number of rooms are less significant, suggesting that location matters more. For instance, renting a larger house in Porto Alegre may be cheaper than a smaller apartment in São Paulo's city center.
+
+The `fire.insurance..R..` variable, predictably, has a very high importance, let's make a scatterplot to see if there's any linear/non-linear relationship with the response.
+
+```{r fig70, fig.width=6, fig.height=4, fig.align='center'}
+plot(Data$rent.amount..R.., Data$fire.insurance..R.., 
+     xlab = "Rent Amount", ylab = "Fire Insurance",
+     main = "Scatter Plot of Rent Amount vs Fire Insurance")
+```
+
+There is a strong linear relationship between fire insurance and rent amount.
+This is not strange since fire insurance premiums are often based on the value of the insured property and the associated risk factors.
+In this case, higher rent prices are typically associated with properties of higher value.
+Properties with higher values are likely to have higher replacement costs and, consequently, higher fire insurance premiums.
+It is worth to mention that insurance premiums can be also influenced by the location of the property.
+Indeed, from the plot we see multiple lines, we can assume that each line could be representing a city.
+
+```{r fig77, fig.width=6, fig.height=3, fig.align='center'}
+library(ggplot2)
+
+rio_data <- subset(Data, Data$city == "Rio de Janeiro")
+sao_paulo_data <- subset(Data, Data$city == "São Paulo")
+porto_alegre_data <- subset(Data, Data$city == "Porto Alegre")
+campinas_data <- subset(Data, Data$city == "Campinas")
+belo_horizonte_data <- subset(Data, Data$city == "Belo Horizonte")
+
+combined_data <- rbind(rio_data, sao_paulo_data, porto_alegre_data, campinas_data, belo_horizonte_data)
+
+ggplot(combined_data, aes(x = rent.amount..R.., y = fire.insurance..R.., color = city)) +
+  geom_point() +
+  labs(title = "Rent Amount vs. Insurance by City") +
+  xlab("Rent Amount") +
+  ylab("Insurance")
+
+
+```
+
+The plot confirms that location affects fire insurance and rent amount. Lines representing different cities show that lower average rent cities have steeper slopes. This indicates that for properties of the same value, the city with lower average rent has higher fire insurance due to larger properties with higher replacement costs. Each city has two distinct lines, suggesting another factor at play. We suspect that the combination of floor and hoa..R.. indicates whether a house is in a condominium. A floor value of 0 signifies either a ground floor condo or an independent house. The presence of a non-zero hoa..R.. value indicates a condominium. To investigate further, we can create a plot for Rio de Janeiro, differentiating between houses in condominiums and independent houses.
+
+```{r fig78 , fig.width=6, fig.height=3, fig.align='center'}
+hoa_zero_data <- subset(Data, Data$city == "Rio de Janeiro" & Data$hoa..R.. == 0 & Data$floor == 0)
+hoa_nonzero_data <- subset(Data, Data$city == "Rio de Janeiro" & Data$hoa..R.. != 0)
+hoa_data <- rbind(transform(hoa_zero_data, Group = "Independent houses"),
+                  transform(hoa_nonzero_data, Group = "Houses in condominium"))
+ggplot(hoa_data, aes(x = rent.amount..R.., y = fire.insurance..R.., color = Group)) +
+  geom_point() +
+  labs(title = "Rent Amount vs. Insurance in Rio de Janeiro",
+       subtitle = "") +
+  xlab("Rent Amount") +
+  ylab("Insurance")
+```
+
+As we can see, our assumption was correct.
+
+# Task 2 
+Our second objective is to *Cluster the houses for rental according to their characteristics*; we are going to compare K-Means and Hierarchical Clustering choosing an optimal number k of clusters with the silhouette and elbow methods.
+We're gonna compare partitions and average silhouette width to determine which one best resembles reality, we're gonna evaluate agreement between the partitions and the different values in each cluster with respect to the initial dataset.
+
+```{r fig71, fig.height = 3, fig.width = 7, fig.align = "center", warning=FALSE, message=FALSE, echo=FALSE}
+
+#REMOVE CATEGORICAL FEATURES
+Data_sc <- Data %>% select_if(is.numeric)
+Data_sc <- as.data.frame(scale(Data_sc))
+
+dist_p <- factoextra::get_dist(Data_sc,method = "pearson")
+dist_e <- factoextra::get_dist(Data_sc,method = "euclidean")
+
+#Optimal K
+set.seed(444)
+
+```
+We get following results for best number of clusters silhouette wise:
+```{r}
+sil_k <- fviz_nbclust(
+  Data_sc,
+  FUNcluster = kmeans,
+  diss = dist_e,
+  method = "silhouette",
+  print.summary = TRUE,
+  k.max = 10
+)
+silh <-fviz_nbclust(
+  Data_sc,
+  FUNcluster = factoextra::hcut,
+  diss = dist_e,
+  method = "silhouette",
+  print.summary = TRUE,
+  k.max = 10
+)
+print(paste("Best k for K-Means(sil):",which(sil_k$data$y == max(sil_k$data$y)),", for HC(sil):",which(silh$data$y == max(silh$data$y))))
+
+```
+Also consulting the elbow method plot, we want to employ K-Means with k = 2 and Hierarchical with k = 4, both using euclidean distance as it proved more efficient for us.
+We get the following partitions:
+```{r fig73, fig.height = 3, fig.width = 5, fig.align = "center",echo=FALSE,warning=FALSE,message=FALSE}
+#Trying with 2 clusters
+#kmeans
+km2 = kmeans(Data_sc, 2, nstart = 1, iter.max = 1e2)
+kmv2 <- fviz_cluster(km2, data = Data_sc, geom = "point", 
+             ggtheme = theme_minimal(), main = "K-Means")
+
+#Evaluating silhouette
+kmv2
+sk2 = silhouette(km2$cluster, 
+                 dist = dist_e)
+sk2v <- fviz_silhouette(sk2,print.summary = FALSE)
+print(paste("K-Means AVG Silhouette width:",mean(sk2v$data$sil_width),", totWSS:",km2$tot.withinss))
+```
+
+```{r fig74, fig.height = 3, fig.width = 5, fig.align = "center", echo=FALSE,warning=FALSE,message=FALSE}
+#hierarchical
+hc2c <- factoextra::hcut(x = dist_e, 
+                         k = 4,
+                         hc_method = "ward.D2")
+e2c <-factoextra::fviz_cluster(list(data = Data_sc, cluster = hc2c$cluster), main = "Hierarchical",labelsize = 0)
+
+e2c#this plots partitions and silhouettes for both
+
+print(paste("Hierarchical's AVG Silhouette width:",hc2c$silinfo$avg.width))
+```
+We're more convinced with the K-Means partition as it has higher average silhouette and partitions the datapoints clearly, while the hierarchical one has a lot of overlap between clusters, so we could reasonably say it has lower between-sum-of-squares and higher within-sum-of-squares.
+
+By looking at the agreement index we can deduce more about the difference between partitions:
+```{r,warning=FALSE,message=FALSE}
+print(paste("Agreement betweenn K-Means and HC",mclust::adjustedRandIndex(km2$cluster,hc2c$cluster)))
+```
+The two partitions differ in number of clusters and algorithms used, since we feel more confident about the K=2-Means partition as it best represents our image of the data(i.e. lower end cheaper housing and higher end more expensive housing) we're going to rely on the K-Means partition for further analysis, so let's see what it represents with respect to the initial dataset:
+```{r}
+#Making 2 dfs for each cluster
+clust1 <- Data[which(km2$cluster == 1),]
+clust2 <- Data[which(km2$cluster == 2),]
+print(paste("Average rent amount in: Cluster 1:",round(mean(clust1$rent.amount..R..),3),", Cluster 2: ",round(mean(clust2$rent.amount..R..),3)))
+```
+As we can see average rent amount in cluster 2 is more than 3 times that of cluster 1, as we've mentioned before we think this reflects lower and higher end housing, but to come to more solid conclusions let's see some more data:
+```{r}
+print(paste("Percentage of houses in Cluster 1:",round(sum(as.numeric(summary(clust1$city))/nrow(Data)),3),", in Cluster 2:",round(sum(as.numeric(summary(clust2$city))/nrow(Data)),3)))
+
+print(paste("Average property tax in Cluster 1:",round(mean(clust1$property.tax..R..),3),", in Cluster 2:",round(mean(clust2$property.tax..R..),3)))
+
+print(paste("Average rent per room in Cluster 1:",round(mean(clust1$rent.amount..R../clust1$rooms),3),", in Cluster 2:",round(mean(clust2$rent.amount..R../clust2$rooms),3)))
+
+
+```
+## Let's also plot a pie chart for cities with respect to cluster
+```{r fig000, fig.align='center',fig.width=6,fig.height=4}
+display_city_pie_chart <- function(Data, data_name){  
+  
+  city_df <- as.data.frame(table(Data$city))
+  colnames(city_df) <- c("city", "count")
+  
+  city_df$percentage <- city_df$count / sum(city_df$count)
+  
+  ggplot(city_df, aes(x = "", y = percentage, fill = city)) +
+    geom_bar(width = 1, stat = "identity") +
+    coord_polar("y", start = 0) + 
+    scale_fill_brewer(palette = "Set3") +
+    theme_void() +
+    labs(title = paste("Pie Chart of Cities in", data_name), fill = "City")
+}
+
+pie1 <- display_city_pie_chart(clust1,"Cluster1")
+pie2 <- display_city_pie_chart(clust2,"Cluster2")
+ggarrange(pie1,pie2,nrow = 1,ncol = 2)
+
+```
+## Drawing conclusions on Task 2
+A partition in higher and lower end housing shows dynamics of the region of brazil we have data about, where the majority of houses are located in Sao Paulo which is the most expensive place on average but also the most frequent city overall, which means that there can be both more and less affordable housing there. The data also confirms the fact that tax and rent per room follow act similarly as rent in the different clusters. 
+As for our business' interests: 
+If they want to acquire a larger volume of real estate with lower rent charged but probably lower acquisition cost, we could suggest to go for one type of house (cluster 1)
+If on the other hand they're more interested in high end houses to charge higher rent(still, with higher acquisition cost), we'd point them to the second cluster. 
+If they wished to diversify their real estate we would be able to identify a potential acquisistion as more, or less expensive.
